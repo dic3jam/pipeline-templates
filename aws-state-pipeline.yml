@@ -1,0 +1,109 @@
+# This pipeline will compile Terraform and push to an AWS account
+# These projects will require the following CI/CD variables set:
+#- AWS_ACCESS_KEY - the access key of a non-console AWS user in the account these resources will be build
+#- AWS_SECRET_ACCESS_KEY - the secret for that user
+#- GITLAB_TOKEN - a token for any valid NUARI Gitlab user
+#- GITLAB_USERNAME - any valid NAURI Gitlab user
+#- SSH_PRIVATE_KEY - Change this variable type to "File". Create an SSH key locally and upload the private key portion to here.
+#- SSH_PUB_KEY - this is actually the fingerprint of the key you create. Do not worry about the end of the fingerprint where it lists the domain/user@hostname. 
+
+default:
+  image:
+    name: hashicorp/terraform
+    entrypoint: [""]
+  timeout: 15 minutes
+  cache:
+    - key: $CI_PIPELINE_ID-terraform-cache
+      paths:
+        - .terraform/
+        - .terraform.lock.hcl
+
+variables:
+  STATEFILE_NAME: "terraform.tfstate"
+  TF_ADDRESS: "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/terraform/state/${STATEFILE_NAME}"
+  TF_USERNAME: ${GITLAB_USERNAME}
+  TF_PASSWORD: ${GITLAB_TOKEN}
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+
+# these lines are necessary to avoid a module credential bug
+before_script:
+  - |-
+    cat <<EOF > ~/.terraformrc
+    credentials "gitlab.com" {
+      token = "${CI_JOB_TOKEN}"
+    }
+    EOF
+
+stages:
+  - format
+  - init
+  - validate
+  - apply
+  - configure
+  - deploy
+  - destroy
+
+format:
+  stage: format
+  script:
+  - terraform fmt -recursive
+  cache: []
+  allow_failure: true
+
+download_provider:
+  stage: init
+  script:
+  - terraform init 
+    -backend-config=address=${TF_ADDRESS}
+    -backend-config=lock_address=${TF_ADDRESS}/lock
+    -backend-config=unlock_address=${TF_ADDRESS}/lock
+    -backend-config=username=${TF_USERNAME}
+    -backend-config=password=${TF_PASSWORD}
+    -backend-config=lock_method=POST
+    -backend-config=unlock_method=DELETE
+    -backend-config=retry_wait_min=5
+
+validate:
+  stage: validate
+  script:
+  - terraform validate
+  allow_failure: true
+
+apply_configuration: 
+  stage: apply
+  script:
+  - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+  - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  - export TF_VAR_SSHPUB=${SSH_PUB_KEY}
+  - terraform apply -auto-approve
+  - terraform output -json > tfstate.json
+  artifacts:
+    when: always
+    name: "artifacts"
+    paths:
+      - inventory
+      - tfstate.json
+  allow_failure: true
+
+.ansible:
+  image: 
+    name: alpinelinux/ansible
+    entrypoint: [""]
+  stage: configure
+  script:
+  - eval $(ssh-agent -s)
+  - chmod 400 "${SSH_PRIVATE_KEY}"
+  - ssh-add "${SSH_PRIVATE_KEY}"
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - ansible-playbook -i inventory config.yml
+  cache: []
+
+destroy_infra: 
+  when: manual
+  stage: destroy
+  script:
+  - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+  - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  - export TF_VAR_SSHPUB=${SSH_PUB_KEY}
+  - terraform destroy -auto-approve
